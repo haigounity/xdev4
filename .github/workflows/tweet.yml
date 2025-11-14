@@ -18,30 +18,25 @@ jobs:
         id: when
         shell: bash
         run: |
-          # JST日付を取得
+          # JST日付と現在時刻（時）を取得
           JST_DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d)
           JST_HOUR_NOW=$(TZ=Asia/Tokyo date +%H)
 
           # その日の疑似乱数を安定生成（リポジトリ名と日付からハッシュ）
           SEED="$(echo "${GITHUB_REPOSITORY}-${JST_DATE}" | sha256sum | cut -c1-8)"
 
-          # 0-23 の“当たりのJST時刻”を決める
+          # 0-23 の“当たりのJST時刻”
           RAND_HOUR=$(( 0x${SEED:0:2} % 24 ))
 
           # 0-59 の“待機分”を決める（投稿分のランダム化）
           RAND_MIN=$(( 0x${SEED:2:2} % 60 ))
-
-          echo "today=${JST_DATE}"
-          echo "now_hour=${JST_HOUR_NOW}"
-          echo "rand_hour=${RAND_HOUR}"
-          echo "rand_min=${RAND_MIN}"
 
           echo "today=${JST_DATE}" >> $GITHUB_OUTPUT
           echo "now_hour=${JST_HOUR_NOW}" >> $GITHUB_OUTPUT
           echo "rand_hour=${RAND_HOUR}" >> $GITHUB_OUTPUT
           echo "rand_min=${RAND_MIN}" >> $GITHUB_OUTPUT
 
-          # “当たりの時間”でなければスキップ
+          # “当たりの時間”でなければスキップ（正常終了）
           if [ "${JST_HOUR_NOW}" -ne "${RAND_HOUR}" ]; then
             echo "Not the chosen hour for today (JST). Skipping."
             exit 0
@@ -72,5 +67,4 @@ jobs:
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python post.py
