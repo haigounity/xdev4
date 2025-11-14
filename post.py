@@ -1,130 +1,154 @@
-import os, time, json, random, re
-from datetime import datetime, timezone
+import os, json, random, re, time
+from datetime import datetime, timezone, timedelta
 import tweepy
 import yaml
-from openai import OpenAI
 
-# ---- 環境変数（GitHub Secretsに格納） ----
 API_KEY        = os.getenv("X_API_KEY")
 API_SECRET     = os.getenv("X_API_SECRET")
 ACCESS_TOKEN   = os.getenv("X_ACCESS_TOKEN")
 ACCESS_SECRET  = os.getenv("X_ACCESS_SECRET")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # LLM用
 
-if not all([API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_SECRET, OPENAI_API_KEY]):
-    raise RuntimeError("Secretsが不足しています（XとOPENAI）。")
+if not all([API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_SECRET]):
+    raise RuntimeError("X API の認証情報が不足しています。Secrets を確認してください。")
 
-# ---- LLMクライアント ----
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ---- ペルソナ読込 ----
+# ---- 読み込み ----
 with open("persona.yaml", "r", encoding="utf-8") as f:
     persona = yaml.safe_load(f)
 
-LANG = persona.get("language", "ja")
-max_chars = persona["guardrails"].get("max_chars", 280)
-banned = set(persona["guardrails"].get("banned_words", []))
-emoji_density = persona["style"].get("emoji_density", "medium")
-hashtags_policy = persona["style"].get("hashtags_policy", "2以内で厳選")
+MAX_CHARS = persona.get("guardrails", {}).get("max_chars", 220)
+BANNED = set(persona.get("guardrails", {}).get("banned_words", []))
 
-# ---- 重複防止のための簡易メモリ ----
+# ---- 簡易テンプレ群（短文・観察メモ中心） ----
+# 句読点や具体性で“AIっぽさ”を抑え、短く断定しすぎない
+TEMPLATES = [
+    "{paper}で{pen}。乾き{drying}。左手に移らない。きょうはこれでいく。",
+    "{grid}は図が収まる。文字は{rule}のほうが速い。きょうは速度優先。",
+    "インク{ink}は{paper}だと薄く見える。裏抜けは{bleed}。",
+    "筆圧を{pressure}。同じページで裏抜けが止まった。",
+    "{pen}の{tip}は細い線が続く。長文は{alt_pen}に替えると楽だった。",
+    "{paper}の紙目は{grain}。ペン先の引っかかりが少ない。",
+    "索引を最初に{index_pages}枚。迷わない。続く。",
+    "クリップは{clip}。厚みが出ない。ノートが平らのまま。",
+    "下敷き{underlay}で筆跡が揺れない。小さい字の比率が安定した。",
+    "{ruler}で罫線を延長。図の修正が早くなる。今日はここまで。",
+    "ゲル{tip}は{drying}。紙は{paper}。速度は十分。",
+    "{label}を先に作る。探す時間が減った。"
+]
+
+PAPERS = ["上質紙", "淡クリーム", "再生紙", "コートっぽい紙", "方眼ノート", "無地ノート"]
+PEN_TYPES = ["ゲルインク", "油性ボール", "染料インク", "顔料インク", "万年筆"]
+TIPS = ["0.38", "0.5", "0.7", "F", "M"]
+DRYINGS = ["速い", "普通", "遅い"]
+BLEEDS = ["出ない", "少し出る", "強い"]
+PRESSURES = ["少し抜く", "いつもより軽くする", "意識して一定にする"]
+ALT_PENS = ["油性0.5", "ゲル0.5", "万年筆F", "ローラーボール0.5"]
+GRAINS = ["細かい", "やや粗い", "均一"]
+GRIDS = ["方眼5mm", "方眼3.7mm", "10mm方眼"]
+RULES = ["3mm罫", "6mm罫", "A罫"]
+INDEX_PAGES = ["2", "3", "4"]
+CLIPS = ["フラット", "ワイヤー", "ゼム"]
+UNDERLAYS = ["薄手", "厚手", "やわらかめ"]
+RULERS = ["アルミ定規", "透明定規", "ステンレス定規"]
+LABELS = ["ラベル", "見出し", "番号"]
+
+def seeded_rand_for_today():
+    # JSTで日付シードを作る（同じ日なら同じ乱数系列）
+    jst = timezone(timedelta(hours=9))
+    today = datetime.now(jst).strftime("%Y%m%d")
+    seed_base = f"{today}-{os.getenv('GITHUB_REPOSITORY','local')}"
+    random.seed(hash(seed_base) & 0xffffffff)
+
+def pick():
+    return {
+        "paper": random.choice(PAPERS),
+        "pen": random.choice(PEN_TYPES),
+        "tip": random.choice(TIPS),
+        "drying": random.choice(DRYINGS),
+        "bleed": random.choice(BLEEDS),
+        "pressure": random.choice(PRESSURES),
+        "alt_pen": random.choice(ALT_PENS),
+        "grain": random.choice(GRAINS),
+        "grid": random.choice(GRIDS),
+        "rule": random.choice(RULES),
+        "index_pages": random.choice(INDEX_PAGES),
+        "clip": random.choice(CLIPS),
+        "underlay": random.choice(UNDERLAYS),
+        "ruler": random.choice(RULERS),
+        "label": random.choice(LABELS)
+    }
+
+def sanitize(text: str) -> str:
+    # 絵文字・ハッシュタグ禁止
+    text = re.sub(r"[#]+[A-Za-z0-9_ぁ-んァ-ヶ一-龠ー]+", "", text)
+    text = re.sub(r"[\U0001F300-\U0001FAFF]", "", text)
+    # banned word除去（単純置換）
+    for w in BANNED:
+        text = text.replace(w, "")
+    text = text.strip()
+    if len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS]
+    return text
+
 MEMO_PATH = ".last_posts.json"
-history = []
-if os.path.exists(MEMO_PATH):
-    try:
-        history = json.load(open(MEMO_PATH, "r", encoding="utf-8"))
-    except Exception:
-        history = []
+def load_history():
+    if os.path.exists(MEMO_PATH):
+        try:
+            return json.load(open(MEMO_PATH, "r", encoding="utf-8"))
+        except Exception:
+            return []
+    return []
 
-def too_similar(text, prev_list, threshold=0.85):
-    # 超簡易：Jaccardで類似判定（厳密にしたければsimhash等に変更）
+def too_similar(cur, prevs, threshold=0.9):
+    # 簡易Jaccard
     def shingles(s, n=4):
         s = re.sub(r"\s+", "", s)
-        return {s[i:i+n] for i in range(max(len(s)-n+1, 1))}
-    cur = shingles(text)
-    for p in prev_list[-10:]:
-        other = shingles(p)
-        j = len(cur & other) / max(len(cur | other), 1)
+        return {s[i:i+n] for i in range(max(len(s)-n+1,1))}
+    a = shingles(cur)
+    for p in prevs[-30:]:
+        b = shingles(p)
+        j = len(a & b) / max(len(a | b), 1)
         if j >= threshold:
             return True
     return False
 
-def build_prompt():
-    topics = persona["content_preferences"].get("topics_pool", [])
-    topic = random.choice(topics) if topics else "日々の気づき"
-    tone = persona["style"].get("tone", "ニュートラル")
-    formality = persona["style"].get("formality", "カジュアル")
-    cta_rate = persona["content_preferences"].get("call_to_action_rate", 0.0)
-    quote_rate = persona["content_preferences"].get("add_quote_rate", 0.0)
-    now_jst = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d (%a) %H:%M")
-
-    sys = f"""
-あなたは「{persona.get('name','ペルソナ')}」として、{LANG}でX向けの短文を作成します。
-口調: {tone} / 文体: {formality} / 絵文字密度: {emoji_density} / ハッシュタグ方針: {hashtags_policy}
-厳守: 上限{max_chars}文字、誹謗中傷・政治・攻撃的表現・個人情報は避ける。
-同じ内容の繰り返しを避け、読みやすい1〜3文で。
-可能なら自然な絵文字・ハッシュタグを少量。
-"""
-    user = f"""
-テーマ候補: {topic}
-現在時刻(JST近似): {now_jst}
-
-追加の確率的ルール:
-- {int(quote_rate*100)}%で短い引用（出典不要・一般的な格言風）
-- {int(cta_rate*100)}%で軽い呼びかけ（質問や行動喚起は控えめ）
-
-出力要件:
-- プレーンテキストのみ（改行は2回まで）
-- ハッシュタグは最大2個まで。多すぎる装飾を避ける
-- 先頭と末尾に同じ絵文字を連打しない
-- 具体的・等身大・即効性のある微小なコツや姿勢を示す
-- 280文字を超えない
-"""
-    return sys.strip(), user.strip()
-
 def generate_text():
-    sys, usr = build_prompt()
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",  # 任意の小型モデルでも可
-        messages=[{"role":"system","content":sys},
-                  {"role":"user","content":usr}],
-        temperature=0.95,
-        top_p=0.9,
-        max_tokens=200
-    )
-    text = resp.choices[0].message.content.strip()
-    # 文字数調整
-    if len(text) > max_chars:
-        text = text[:max_chars-1] + "…"
-    # NGワード除去（シンプル）
-    for w in banned:
-        text = text.replace(w, "")
-    # 類似チェック
-    if too_similar(text, history):
-        text += "\n#今日の学び"
-        if len(text) > max_chars:
-            text = text[:max_chars]
-    return text
+    seeded_rand_for_today()
+    tries = 0
+    history = load_history()
+    while tries < 8:
+        tmpl = random.choice(TEMPLATES)
+        vars = pick()
+        text = tmpl.format(**vars)
+        text = sanitize(text)
+        if not too_similar(text, history):
+            return text
+        tries += 1
+    # 似通ってしまう場合のフォールバック
+    fallback = random.choice(persona.get("example_posts", ["きょうはここまで。"]))
+    return sanitize(fallback)
 
 def post_to_x(text):
-    auth_client = tweepy.Client(
+    client = tweepy.Client(
         consumer_key=API_KEY,
         consumer_secret=API_SECRET,
         access_token=ACCESS_TOKEN,
         access_token_secret=ACCESS_SECRET
     )
-    r = auth_client.create_tweet(text=text)
-    return r.data
+    resp = client.create_tweet(text=text)
+    return resp.data
+
+def save_history(text):
+    hist = load_history()
+    hist.append(text)
+    try:
+        json.dump(hist[-100:], open(MEMO_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 def main():
     text = generate_text()
     data = post_to_x(text)
-    # 履歴保存
-    history.append(text)
-    try:
-        json.dump(history[-50:], open(MEMO_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    save_history(text)
     print("Tweeted:", data)
 
 if __name__ == "__main__":
